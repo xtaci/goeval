@@ -3,6 +3,7 @@ package goeval
 import (
 	"errors"
 	"fmt"
+	//	"github.com/davecgh/go-spew/spew"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -10,17 +11,24 @@ import (
 	"strconv"
 )
 
-// Func represents an interpreted function definition.
-type Func struct {
-	Def *ast.FuncLit
-}
+var (
+	Builtins = map[string]interface{}{
+		"nil":    nil,
+		"true":   true,
+		"false":  false,
+		"append": Append,
+		"make":   Make,
+		"len":    Len,
+	}
+)
 
+// variable scope, recursive definition
 type Scope struct {
-	Vals   map[string]interface{} // 变量,函数表
+	Vals   map[string]interface{} // all variables in current scope
 	Parent *Scope
 }
 
-// NewScope creates a new initialized scope
+// create a new variable scope
 func NewScope() *Scope {
 	s := &Scope{
 		Vals: map[string]interface{}{},
@@ -28,9 +36,10 @@ func NewScope() *Scope {
 	return s
 }
 
-// Get walks the scope and finds the value of interest
-func (scope *Scope) Get(name string) (val interface{}, exists bool) {
+// search variable from inner-most scope
+func (scope *Scope) Get(name string) (val interface{}) {
 	currentScope := scope
+	exists := false
 	for !exists && currentScope != nil {
 		val, exists = currentScope.Vals[name]
 		currentScope = currentScope.Parent
@@ -73,45 +82,34 @@ func (scope *Scope) NewChild() *Scope {
 	return s
 }
 
-func (s *Scope) Eval(line string) (interface{}, error) {
-	expr, err := parser.ParseExpr("func(){" + line + "}()")
+// Eval evaluates a string
+func (s *Scope) Eval(str string) (interface{}, error) {
+	expr, err := parser.ParseExpr("func(){" + str + "}()")
 	if err != nil {
 		return nil, err
 	}
-	//spew.Dump(expr)
 	return s.Interpret(expr.(*ast.CallExpr).Fun.(*ast.FuncLit).Body)
 }
 
 // Interpret interprets an ast.Node and returns the value.
 func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
-	builtinScope := map[string]interface{}{
-		"nil":    nil,
-		"true":   true,
-		"false":  false,
-		"append": Append,
-		"make":   Make,
-		"len":    Len,
-	}
-
 	switch e := expr.(type) {
-	case *ast.Ident:
-
+	case *ast.Ident: // An Ident node represents an identifier.
 		typ, err := StringToType(e.Name)
 		if err == nil {
 			return typ, err
 		}
 
-		obj, exists := scope.Get(e.Name)
-		if !exists {
-			// TODO make builtinScope root of other scopes
-			obj, exists = builtinScope[e.Name]
-			if !exists {
-				return nil, fmt.Errorf("can't find EXPR %s", e.Name)
-			}
+		if obj, exists := Builtins[e.Name]; exists {
+			return obj, nil
 		}
-		return obj, nil
 
-	case *ast.SelectorExpr:
+		if obj := scope.Get(e.Name); obj != nil {
+			return obj, nil
+		}
+		return nil, fmt.Errorf("can't find EXPR %s", e.Name)
+
+	case *ast.SelectorExpr: // A SelectorExpr node represents an expression followed by a selector.
 		X, err := scope.Interpret(e.X)
 		if err != nil {
 			return nil, err
@@ -140,6 +138,13 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 			return nil, err
 		}
 
+		// make sure fun is a function
+		rf := reflect.ValueOf(fun)
+		if rf.Kind() != reflect.Func {
+			return nil, fmt.Errorf("Not a function %#v", fun)
+		}
+
+		// interpret args
 		args := make([]reflect.Value, len(e.Args))
 		for i, arg := range e.Args {
 			interpretedArg, err := scope.Interpret(arg)
@@ -149,17 +154,8 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 			args[i] = reflect.ValueOf(interpretedArg)
 		}
 
-		switch funV := fun.(type) {
-		case reflect.Type:
-			return args[0].Convert(funV).Interface(), nil
-		case *Func:
-			// TODO enforce func return values
-			return scope.Interpret(funV.Def.Body)
-		}
-
-		funVal := reflect.ValueOf(fun)
-
-		values := ValuesToInterfaces(funVal.Call(args))
+		// call
+		values := ValuesToInterfaces(rf.Call(args))
 		if len(values) == 0 {
 			return nil, nil
 		} else if len(values) == 1 {
@@ -303,6 +299,7 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 			return nil, errors.New("slice index out of range")
 		}
 		return xVal.Index(iVal).Interface(), nil
+
 	case *ast.SliceExpr:
 		low, err := scope.Interpret(e.Low)
 		if err != nil {
@@ -336,8 +333,6 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 	case *ast.ParenExpr:
 		return scope.Interpret(e.X)
 
-	case *ast.FuncLit:
-		return &Func{e}, nil
 	case *ast.ReturnStmt:
 		results := make([]interface{}, len(e.Results))
 		for i, result := range e.Results {
@@ -356,7 +351,6 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 		return results, nil
 
 	case *ast.AssignStmt:
-		// TODO implement type checking
 		define := e.Tok == token.DEFINE
 		lhs := make([]string, len(e.Lhs))
 		for i, id := range e.Lhs {
@@ -374,6 +368,7 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 			}
 			rhs[i] = val
 		}
+
 		if len(rhs) != 1 && len(rhs) != len(lhs) {
 			return nil, fmt.Errorf("assignment count mismatch: %d = %d", len(lhs), len(rhs))
 		}
@@ -385,8 +380,8 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 			}
 			for i := 0; i < rhsLen; i++ {
 				variable := lhs[i]
-				_, exists := scope.Get(variable)
-				if !exists && !define {
+				v := scope.Get(variable)
+				if v == nil && !define {
 					return nil, fmt.Errorf("variable %#v is not defined", variable)
 				}
 				scope.Set(variable, rhsV.Index(i).Interface())
@@ -394,17 +389,19 @@ func (scope *Scope) Interpret(expr ast.Node) (interface{}, error) {
 		} else {
 			for i, r := range rhs {
 				variable := lhs[i]
-				_, exists := scope.Get(variable)
-				if !exists && !define {
+				v := scope.Get(variable)
+				if v == nil && !define {
 					return nil, fmt.Errorf("variable %#v is not defined", variable)
 				}
 				scope.Set(variable, r)
 			}
 		}
+
 		if len(rhs) > 1 {
 			return rhs, nil
 		}
 		return rhs[0], nil
+
 	case *ast.ForStmt:
 		s := scope.NewChild()
 		s.Interpret(e.Init)
